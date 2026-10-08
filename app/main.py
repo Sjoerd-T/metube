@@ -17,7 +17,7 @@ import json
 import pathlib
 import re
 import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from watchfiles import DefaultFilter, Change, awatch
 
 import bg_tasks
@@ -347,6 +347,21 @@ class ObjectSerializer(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 serializer = ObjectSerializer()
+
+
+def _download_file_url(dl) -> str | None:
+    """Build the same fetchable path the UI uses for a completed download."""
+    if not dl.filename:
+        return None
+    base_url = (
+        config.PUBLIC_HOST_AUDIO_URL
+        if dl.download_type == 'audio'
+        else config.PUBLIC_HOST_URL
+    )
+    folder = '/'.join(quote(part, safe='') for part in (dl.folder or '').split('/') if part)
+    if folder:
+        base_url += folder + '/'
+    return base_url + quote(dl.filename, safe='')
 
 _STATE_DIR_REAL = os.path.realpath(config.STATE_DIR)
 
@@ -699,6 +714,7 @@ class Notifier(DownloadQueueNotifier):
         payload = {
             'event': 'download.completed',
             'download': dl.to_public_dict(),
+            'file_url': _download_file_url(dl),
         }
         try:
             timeout = ClientTimeout(total=10)
