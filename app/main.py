@@ -1342,7 +1342,9 @@ async def history(request):
     for _, v in dqueue.queue.items():
         history['queue'].append(v.info)
     for _, v in dqueue.done.items():
-        history['done'].append(v.info)
+        done_info = v.info.to_public_dict()
+        done_info['file_url'] = _download_file_url(v.info) if v.info.status == 'finished' else None
+        history['done'].append(done_info)
     for _, v in dqueue.pending.items():
         history['pending'].append(v.info)
 

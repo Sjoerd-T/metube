@@ -1995,7 +1995,13 @@ class DownloadQueue:
                 # clobbering an existing pending entry's options with a
                 # fresh DownloadInfo built from possibly-different args.
                 title = entry.get('title') or key
-                return {'status': 'ok', 'msg': f'Already in queue: {title}'}
+                existing = self.queue.get(key) or self.pending.get(key)
+                return {
+                    'status': 'ok',
+                    'msg': f'Already in queue: {title}',
+                    'id': existing.info.id,
+                    'url': existing.info.url,
+                }
             dl = DownloadInfo(
                 id=entry['id'],
                 title=entry.get('title') or entry['id'],
@@ -2028,7 +2034,7 @@ class DownloadQueue:
                 # Must not read as success: a subscription marks an entry seen
                 # when its add succeeds, and would never offer it again.
                 return error
-            return {'status': 'ok'}
+            return {'status': 'ok', 'id': dl.id, 'url': dl.url}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
 
     async def __record_add_failure(
