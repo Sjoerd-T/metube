@@ -1,0 +1,32 @@
+name: Sync upstream into download webhook branch
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-download-webhook
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/download-webhook
+          fetch-depth: 0
+
+      - name: Merge upstream master and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/alexta69/metube.git
+          git fetch upstream master
+          git merge --no-edit upstream/master
+          git push origin HEAD:feat/download-webhook
