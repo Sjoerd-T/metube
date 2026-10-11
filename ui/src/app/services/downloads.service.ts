@@ -1,9 +1,9 @@
 import { inject, Injectable } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
-import { of, Subject } from 'rxjs';
+import { Observable, of, Subject } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { MeTubeSocket } from './metube-socket.service';
-import { Download, Status, State } from '../interfaces';
+import { Download, FormatCatalog, Status, State } from '../interfaces';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 export interface AddDownloadPayload {
@@ -28,6 +28,25 @@ export interface AddDownloadPayload {
   clipEnd?: string;
   videoPassword?: string;
 }
+
+export interface BrowsePayload {
+  url: string;
+  playlistItemLimit: number;
+  ytdlOptionsPresets: string[];
+  ytdlOptionsOverrides: string;
+}
+
+export interface BrowseEntry {
+  url: string;
+  title: string;
+  duration: number | null;
+}
+
+export interface BrowseResult extends Status {
+  title?: string;
+  entries?: BrowseEntry[];
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -42,9 +61,12 @@ export class DownloadsService {
   customDirsChanged = new Subject<Record<string, string[]>>();
   ytdlOptionsChanged = new Subject<Record<string, unknown>>();
   configurationChanged = new Subject<Record<string, unknown>>();
+  formatsChanged = new Subject<FormatCatalog>();
   updated = new Subject<void>();
 
   configuration: Record<string, unknown> = {};
+  // The download options the server offers; null until it sends them.
+  formats: FormatCatalog | null = null;
   customDirs: Record<string, string[]> = {};
 
   constructor() {
@@ -106,6 +128,13 @@ export class DownloadsService {
       this.done.delete(data);
       this.doneChanged.next();
     });
+    this.socket.fromEvent('formats')
+    .pipe(takeUntilDestroyed())
+    .subscribe((strdata: string) => {
+      const data: FormatCatalog = JSON.parse(strdata);
+      this.formats = data;
+      this.formatsChanged.next(data);
+    });
     this.socket.fromEvent('configuration')
     .pipe(takeUntilDestroyed())
     .subscribe((strdata: string) => {
@@ -165,6 +194,17 @@ export class DownloadsService {
     if (ce) body['clip_end'] = ce;
     if (payload.videoPassword) body['video_password'] = payload.videoPassword;
     return this.http.post<Status>('add', body).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
+  public browse(payload: BrowsePayload): Observable<BrowseResult> {
+    return this.http.post<BrowseResult>('browse', {
+      url: payload.url,
+      playlist_item_limit: payload.playlistItemLimit,
+      ytdl_options_presets: payload.ytdlOptionsPresets,
+      ytdl_options_overrides: payload.ytdlOptionsOverrides,
+    }).pipe(
       catchError(this.handleHTTPError)
     );
   }

@@ -21,8 +21,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from watchfiles import DefaultFilter, Change, awatch
 
 import bg_tasks
+import format_catalog
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
-from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
+from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, browse_playlist, coerce_optional_bool
 from yt_dlp.version import __version__ as yt_dlp_version
 
 log = logging.getLogger('main')
@@ -408,16 +409,19 @@ def _origin_is_trusted(origin, sec_fetch_site, hosts) -> bool:
     if origin and ('*' in _cors_origins or origin in _cors_origins):
         return True
     if sec_fetch_site:
-        # Sent by every current browser. It answers the question directly and,
-        # unlike comparing Origin with Host, survives a reverse proxy that
-        # rewrites Host. 'none' is a user-initiated request, such as one typed
-        # into the address bar.
+        # It answers the question directly and, unlike comparing Origin with
+        # Host, survives a reverse proxy that rewrites Host. But browsers send
+        # it only to secure origins (HTTPS or localhost), so a plain-HTTP
+        # instance on a LAN address never gets it. 'none' is a user-initiated
+        # request, such as one typed into the address bar.
         return sec_fetch_site in ('same-origin', 'none')
     if not origin:
         return True
-    # An older browser: fall back to comparing Origin with the host the request
+    # Plain HTTP or an older browser: compare Origin with the host the request
     # was addressed to. X-Forwarded-Host is safe to accept here, since a page
-    # cannot set it on a cross-origin request without a preflight.
+    # cannot set it on a cross-origin request without a preflight. A proxy that
+    # rewrites Host and sends no X-Forwarded-Host (nginx's `Host $host` drops
+    # the port) makes MeTube's own UI look cross-origin; see _log_refusal.
     try:
         netloc = urlparse(origin).netloc.lower()
     except ValueError:
@@ -428,15 +432,31 @@ def _origin_is_trusted(origin, sec_fetch_site, hosts) -> bool:
 _SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
 
 
+def _log_refusal(what, origin, sec_fetch_site, hosts):
+    if sec_fetch_site:
+        # The browser itself said the request came from another site.
+        log.warning(
+            'Refused cross-origin %s from %s. If this is a bookmarklet or extension you use, '
+            'add its origin to CORS_ALLOWED_ORIGINS.', what, origin)
+        return
+    host, forwarded_host = hosts
+    log.warning(
+        'Refused cross-origin %s from %s: it was addressed to Host %s%s. If %s is where you '
+        'open MeTube, a reverse proxy in front of it is rewriting the Host header; have it '
+        'pass the original one (in nginx: proxy_set_header Host $http_host), or add that '
+        'address to CORS_ALLOWED_ORIGINS. If it is a bookmarklet or extension you use, add '
+        'its origin to CORS_ALLOWED_ORIGINS.',
+        what, origin, host, f' (X-Forwarded-Host {forwarded_host})' if forwarded_host else '', origin)
+
+
 @web.middleware
 async def cross_origin_guard(request, handler):
     if request.method not in _SAFE_METHODS:
         origin = request.headers.get('Origin')
         hosts = (request.headers.get('Host'), request.headers.get('X-Forwarded-Host'))
-        if not _origin_is_trusted(origin, request.headers.get('Sec-Fetch-Site'), hosts):
-            log.warning(
-                'Refused cross-origin %s %s from %s. If this is a bookmarklet or extension you '
-                'use, add its origin to CORS_ALLOWED_ORIGINS.', request.method, request.path, origin)
+        sec_fetch_site = request.headers.get('Sec-Fetch-Site')
+        if not _origin_is_trusted(origin, sec_fetch_site, hosts):
+            _log_refusal(f'{request.method} {request.path}', origin, sec_fetch_site, hosts)
             # Make the refusal itself readable to the page that sent it. A
             # bookmarklet whose site is not listed would otherwise see only a
             # network error, indistinguishable from MeTube being down, and
@@ -462,7 +482,14 @@ def _socketio_origin_allowed(origin, environ):
     # page on another site from connecting and reading the queue, history and
     # configuration the connect handler sends.
     hosts = (environ.get('HTTP_HOST'), environ.get('HTTP_X_FORWARDED_HOST'))
-    return _origin_is_trusted(origin, environ.get('HTTP_SEC_FETCH_SITE'), hosts)
+    sec_fetch_site = environ.get('HTTP_SEC_FETCH_SITE')
+    if _origin_is_trusted(origin, sec_fetch_site, hosts):
+        return True
+    # engine.io asks again while building the refusal response; log once.
+    if not environ.get('metube.origin_refusal_logged'):
+        environ['metube.origin_refusal_logged'] = True
+        _log_refusal('Socket.IO connection', origin, sec_fetch_site, hosts)
+    return False
 
 
 app = web.Application(middlewares=[cross_origin_guard, state_dir_guard])
@@ -476,15 +503,6 @@ if '*' in _cors_origins and len(_cors_origins) > 1:
 sio = socketio.AsyncServer(cors_allowed_origins=_socketio_origin_allowed)
 sio.attach(app, socketio_path=config.URL_PREFIX + 'socket.io')
 routes = web.RouteTableDef()
-VALID_SUBTITLE_FORMATS = {'srt', 'txt', 'vtt', 'ttml', 'sbv', 'scc', 'dfxp'}
-VALID_SUBTITLE_MODES = {'auto_only', 'manual_only', 'prefer_manual', 'prefer_auto'}
-SUBTITLE_LANGUAGE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,34}$')
-VALID_DOWNLOAD_TYPES = {'video', 'audio', 'captions', 'thumbnail'}
-VALID_VIDEO_CODECS = {'auto', 'h264', 'h265', 'av1', 'vp9'}
-VALID_VIDEO_FORMATS = {'any', 'mp4', 'ios'}
-VALID_AUDIO_FORMATS = {'auto', 'm4a', 'mp3', 'opus', 'wav', 'flac'}
-VALID_AUDIO_TAGS = {'with_cover', 'no_cover', 'none'}
-VALID_THUMBNAIL_FORMATS = {'jpg'}
 def _parse_ytdl_options_overrides(value, *, enabled: bool) -> dict:
     if value is None or value == '':
         return {}
@@ -638,6 +656,12 @@ def _parse_ytdl_options_presets(post: dict) -> list[str]:
     )
 
 
+def _require_configured_presets(names: list[str]) -> None:
+    for preset_name in names:
+        if preset_name not in config.YTDL_OPTIONS_PRESETS:
+            raise web.HTTPBadRequest(reason='ytdl_options_presets must only contain configured preset names')
+
+
 def _migrate_legacy_request(post: dict) -> dict:
     """
     BACKWARD COMPATIBILITY: Translate old API request schema into the new one.
@@ -662,7 +686,7 @@ def _migrate_legacy_request(post: dict) -> dict:
     old_video_codec = str(post.get("video_codec") or "auto").strip().lower()
 
     # 'auto' postdates the legacy API, where it never named an audio format.
-    if old_format in VALID_AUDIO_FORMATS - {'auto'}:
+    if old_format in format_catalog.format_ids('audio') and old_format != 'auto':
         post["download_type"] = "audio"
         post["codec"] = "auto"
         post["format"] = old_format
@@ -884,7 +908,7 @@ def parse_download_options(post: dict) -> dict:
     auto_start = post.get('auto_start')
     split_by_chapters = post.get('split_by_chapters')
     sponsorblock = bool(post.get('sponsorblock'))
-    audio_tags = str(post.get('audio_tags') or 'with_cover').strip().lower()
+    audio_tags = str(post.get('audio_tags') or format_catalog.choice_default('audio', 'audio_tags')).strip().lower()
     chapter_template = post.get('chapter_template')
     subtitle_language = post.get('subtitle_language')
     subtitle_mode = post.get('subtitle_mode')
@@ -902,11 +926,11 @@ def parse_download_options(post: dict) -> dict:
     if chapter_template is None:
         chapter_template = config.OUTPUT_TEMPLATE_CHAPTER
     if subtitle_language is None:
-        subtitle_language = 'en'
+        subtitle_language = format_catalog.choice_default('captions', 'subtitle_language')
     if subtitle_mode is None:
-        subtitle_mode = 'prefer_manual'
+        subtitle_mode = format_catalog.choice_default('captions', 'subtitle_mode')
     download_type = str(download_type).strip().lower()
-    codec = str(codec or 'auto').strip().lower()
+    codec = str(codec or format_catalog.choice_default('video', 'codec')).strip().lower()
     format = str(format or '').strip().lower()
     quality = str(quality).strip().lower()
     subtitle_language = str(subtitle_language).strip()
@@ -922,48 +946,15 @@ def parse_download_options(post: dict) -> dict:
     if video_password is not None and not isinstance(video_password, str):
         raise web.HTTPBadRequest(reason='video_password must be a string')
 
-    if not SUBTITLE_LANGUAGE_RE.fullmatch(subtitle_language):
-        raise web.HTTPBadRequest(reason='subtitle_language must match pattern [A-Za-z0-9-] and be at most 35 characters')
-    if subtitle_mode not in VALID_SUBTITLE_MODES:
-        raise web.HTTPBadRequest(reason=f'subtitle_mode must be one of {sorted(VALID_SUBTITLE_MODES)}')
-    for preset_name in ytdl_options_presets:
-        if preset_name not in config.YTDL_OPTIONS_PRESETS:
-            raise web.HTTPBadRequest(reason='ytdl_options_presets must only contain configured preset names')
+    _require_configured_presets(ytdl_options_presets)
 
-    if audio_tags not in VALID_AUDIO_TAGS:
-        raise web.HTTPBadRequest(reason=f'audio_tags must be one of {sorted(VALID_AUDIO_TAGS)}')
-
-    if download_type not in VALID_DOWNLOAD_TYPES:
-        raise web.HTTPBadRequest(reason=f'download_type must be one of {sorted(VALID_DOWNLOAD_TYPES)}')
-    if codec not in VALID_VIDEO_CODECS:
-        raise web.HTTPBadRequest(reason=f'codec must be one of {sorted(VALID_VIDEO_CODECS)}')
-
-    if download_type == 'video':
-        if format not in VALID_VIDEO_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_VIDEO_FORMATS)} for video')
-        if quality not in {'best', 'worst', '2160', '1440', '1080', '720', '480', '360', '240'}:
-            raise web.HTTPBadRequest(reason="quality must be one of ['best', '2160', '1440', '1080', '720', '480', '360', '240', 'worst'] for video")
-    elif download_type == 'audio':
-        if format not in VALID_AUDIO_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_AUDIO_FORMATS)} for audio')
-        allowed_audio_qualities = {'best'}
-        if format == 'mp3':
-            allowed_audio_qualities |= {'320', '192', '128'}
-        elif format == 'm4a':
-            allowed_audio_qualities |= {'192', '128'}
-        if quality not in allowed_audio_qualities:
-            raise web.HTTPBadRequest(reason=f'quality must be one of {sorted(allowed_audio_qualities)} for format {format}')
-        codec = 'auto'
-    elif download_type == 'captions':
-        if format not in VALID_SUBTITLE_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_SUBTITLE_FORMATS)} for captions')
-        quality = 'best'
-        codec = 'auto'
-    elif download_type == 'thumbnail':
-        if format not in VALID_THUMBNAIL_FORMATS:
-            raise web.HTTPBadRequest(reason=f'format must be one of {sorted(VALID_THUMBNAIL_FORMATS)} for thumbnail')
-        quality = 'best'
-        codec = 'auto'
+    try:
+        format_catalog.check_subtitle_language(subtitle_language)
+        format_catalog.check_subtitle_mode(subtitle_mode)
+        format_catalog.check_audio_tags(audio_tags)
+        codec, format, quality = format_catalog.resolve_selection(download_type, codec, format, quality)
+    except format_catalog.InvalidOption as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
 
     try:
         playlist_item_limit = int(playlist_item_limit)
@@ -1065,6 +1056,41 @@ async def add(request):
         sponsorblock=o['sponsorblock'],
         audio_tags=o['audio_tags'],
         video_password=o['video_password'],
+    )
+    return web.Response(text=serializer.encode(status))
+
+
+@routes.get(config.URL_PREFIX + 'formats')
+async def formats(request):
+    """The download options /add accepts, with labels; see format_catalog."""
+    return web.Response(
+        text=serializer.encode(format_catalog.public_catalog()),
+        content_type='application/json',
+    )
+
+@routes.post(config.URL_PREFIX + 'browse')
+async def browse(request):
+    """Flat-probe a playlist/channel URL and list its entries; queues nothing."""
+    post = await _read_json_request(request)
+    url = str(post.get('url') or '').strip()
+    if not url:
+        raise web.HTTPBadRequest(reason="missing 'url'")
+    ytdl_options_presets = _parse_ytdl_options_presets(post)
+    _require_configured_presets(ytdl_options_presets)
+    ytdl_options_overrides = _parse_ytdl_options_overrides(
+        post.get('ytdl_options_overrides'),
+        enabled=config.ALLOW_YTDL_OPTIONS_OVERRIDES,
+    )
+    playlist_item_limit = post.get('playlist_item_limit')
+    if playlist_item_limit is None:
+        playlist_item_limit = config.DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT
+    try:
+        playlist_item_limit = int(playlist_item_limit)
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(reason='playlist_item_limit must be an integer') from exc
+    log.info("Received request to browse playlist (item limit %s)", playlist_item_limit)
+    status = await browse_playlist(
+        config, url, playlist_item_limit, ytdl_options_presets, ytdl_options_overrides
     )
     return web.Response(text=serializer.encode(status))
 
@@ -1356,6 +1382,7 @@ async def connect(sid, environ):
     log.info(f"Client connected: {sid}")
     await sio.emit('all', serializer.encode(dqueue.get()), to=sid)
     await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in submgr.list_all()]), to=sid)
+    await sio.emit('formats', serializer.encode(format_catalog.public_catalog()), to=sid)
     await sio.emit('configuration', serializer.encode(config.frontend_safe()), to=sid)
     if config.CUSTOM_DIRS:
         # get_custom_dirs() can walk the whole download tree on a cache miss;
@@ -1477,6 +1504,7 @@ async def add_cors(request):
     return web.Response(text=serializer.encode({"status": "ok"}))
 
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'add', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'browse', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'cancel-add', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'retry', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'subscribe', add_cors)

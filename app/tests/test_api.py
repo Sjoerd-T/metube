@@ -879,6 +879,95 @@ async def test_legacy_browser_origin_falls_back_to_host(monkeypatch, headers, ex
     assert await _guarded_status(monkeypatch, [], headers) == expected
 
 
+@pytest.fixture
+def mock_browse(monkeypatch):
+    m = AsyncMock(return_value={"status": "ok", "title": "L", "entries": []})
+    monkeypatch.setattr(main, "browse_playlist", m)
+    return m
+
+
+@pytest.mark.asyncio
+async def test_browse_returns_helper_result_and_passes_args(mock_browse, monkeypatch):
+    monkeypatch.setattr(main.config, "YTDL_OPTIONS_PRESETS", {"Preset A": {}})
+    monkeypatch.setattr(main.config, "ALLOW_YTDL_OPTIONS_OVERRIDES", True)
+    expected = {
+        "status": "ok",
+        "title": "L",
+        "entries": [{"url": "https://example.com/a", "title": "A", "duration": 3}],
+    }
+    mock_browse.return_value = expected
+    req = _json_request(
+        {
+            "url": "  https://example.com/pl  ",
+            "playlist_item_limit": "7",
+            "ytdl_options_presets": ["Preset A"],
+            "ytdl_options_overrides": '{"a": 1}',
+        }
+    )
+    resp = await main.browse(req)
+    assert resp.status == 200
+    assert json.loads(resp.text) == expected
+    mock_browse.assert_awaited_once_with(
+        main.config, "https://example.com/pl", 7, ["Preset A"], {"a": 1}
+    )
+
+
+@pytest.mark.asyncio
+async def test_browse_defaults_limit_from_config(mock_browse, monkeypatch):
+    monkeypatch.setattr(main.config, "DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT", "25")
+    resp = await main.browse(_json_request({"url": "https://example.com/pl"}))
+    assert resp.status == 200
+    call = mock_browse.await_args
+    assert call.args[1:] == ("https://example.com/pl", 25, [], {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"url": ""}, {"url": "   "}, {"url": None}])
+async def test_browse_requires_url(mock_browse, body):
+    with pytest.raises(web.HTTPBadRequest):
+        await main.browse(_json_request(body))
+    mock_browse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browse_rejects_unknown_preset(mock_browse):
+    req = _json_request({"url": "https://example.com/pl", "ytdl_options_presets": ["Missing"]})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.browse(req)
+    mock_browse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browse_rejects_overrides_when_disabled(mock_browse, monkeypatch):
+    monkeypatch.setattr(main.config, "ALLOW_YTDL_OPTIONS_OVERRIDES", False)
+    req = _json_request(
+        {"url": "https://example.com/pl", "ytdl_options_overrides": '{"exec": "echo hi"}'}
+    )
+    with pytest.raises(web.HTTPBadRequest):
+        await main.browse(req)
+    mock_browse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["abc", [], {}])
+async def test_browse_rejects_bad_playlist_item_limit(mock_browse, bad):
+    req = _json_request({"url": "https://example.com/pl", "playlist_item_limit": bad})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.browse(req)
+    mock_browse.assert_not_awaited()
+
+
+def test_browse_route_is_registered_on_the_real_app():
+    registered = {
+        (r.method, r.resource.canonical)
+        for r in main.app.router.routes()
+        if r.resource is not None
+    }
+    path = main.config.URL_PREFIX + "browse"
+    assert ("POST", path) in registered
+    assert ("OPTIONS", path) in registered
+
+
 def test_guard_is_installed_on_the_real_app():
     assert main.cross_origin_guard in main.app.middlewares
     assert main.sio.eio.cors_allowed_origins is main._socketio_origin_allowed
@@ -909,3 +998,123 @@ async def test_socketio_accepts_own_ui_when_origins_are_named(monkeypatch):
     # bookmarklet's site locked MeTube's own UI out of its socket.
     headers = {"Origin": "https://metube.example", "Sec-Fetch-Site": "same-origin"}
     assert await _socketio_handshake_status(monkeypatch, ["https://www.youtube.com"], headers) == 200
+
+
+# Issue #1085: browsers send Sec-Fetch-Site only to HTTPS or localhost, so a
+# plain-HTTP LAN instance is judged by Origin vs Host alone, and a proxy that
+# rewrites Host (nginx `Host $host` drops the port) makes the UI's own
+# requests look cross-origin. The check stays strict; the log says why.
+_PROXIED_PLAIN_HTTP_UI = {"Origin": "http://192.168.1.100:6510", "Host": "192.168.1.100"}
+
+
+def _refusal_logs(caplog):
+    return [r.getMessage() for r in caplog.records if "Refused cross-origin" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_host_rewriting_proxy_refusal_explains_the_proxy(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="main")
+    assert await _guarded_status(monkeypatch, [], _PROXIED_PLAIN_HTTP_UI) == 403
+    [msg] = _refusal_logs(caplog)
+    assert "POST /add from http://192.168.1.100:6510" in msg
+    assert "addressed to Host 192.168.1.100." in msg
+    assert "proxy_set_header Host $http_host" in msg
+
+
+@pytest.mark.asyncio
+async def test_host_rewriting_proxy_passes_with_forwarded_host(monkeypatch):
+    headers = {**_PROXIED_PLAIN_HTTP_UI, "X-Forwarded-Host": "192.168.1.100:6510"}
+    assert await _guarded_status(monkeypatch, [], headers) == 200
+
+
+@pytest.mark.asyncio
+async def test_listing_the_ui_address_admits_it(monkeypatch):
+    # What the reporter did, and what the log suggests as the alternative.
+    assert await _guarded_status(monkeypatch, ["http://192.168.1.100:6510"], _PROXIED_PLAIN_HTTP_UI) == 200
+
+
+@pytest.mark.asyncio
+async def test_cross_site_refusal_keeps_the_bookmarklet_hint(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="main")
+    assert await _guarded_status(monkeypatch, [], _CROSS_SITE) == 403
+    [msg] = _refusal_logs(caplog)
+    assert "If this is a bookmarklet or extension you use" in msg
+    assert "proxy" not in msg
+
+
+@pytest.mark.asyncio
+async def test_socketio_refusal_is_logged_once_with_the_hint(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="main")
+    assert await _socketio_handshake_status(monkeypatch, [], _PROXIED_PLAIN_HTTP_UI) == 400
+    [msg] = _refusal_logs(caplog)
+    assert "Socket.IO connection from http://192.168.1.100:6510" in msg
+    assert "proxy_set_header Host $http_host" in msg
+
+
+@pytest.mark.asyncio
+async def test_formats_endpoint_returns_the_catalog(mock_dqueue):
+    import format_catalog
+
+    resp = await main.formats(MagicMock(spec=web.Request))
+    assert resp.status == 200
+    assert resp.content_type == 'application/json'
+    assert json.loads(resp.text) == format_catalog.CATALOG
+
+
+def test_formats_endpoint_is_routed_as_a_get():
+    # A GET, so the cross-origin guard lets browser extensions read it
+    # (test_cross_site_get_is_not_blocked) and no CORS preflight is needed.
+    routes = {(r.method, r.resource.canonical) for r in main.app.router.routes()}
+    assert ("GET", main.config.URL_PREFIX + "formats") in routes
+
+
+@pytest.mark.asyncio
+async def test_connect_sends_the_catalog_with_the_configuration(mock_dqueue, monkeypatch):
+    import format_catalog
+
+    emitted = []
+
+    async def fake_emit(event, data=None, to=None):
+        emitted.append((event, data))
+
+    monkeypatch.setattr(main.sio, 'emit', fake_emit)
+    monkeypatch.setattr(main, 'submgr', MagicMock(list_all=MagicMock(return_value=[])))
+    monkeypatch.setattr(main.config, 'CUSTOM_DIRS', False)
+    monkeypatch.setattr(main.config, 'YTDL_OPTIONS_FILE', '')
+    await main.connect('sid-1', {})
+
+    events = [e for e, _ in emitted]
+    assert 'formats' in events and 'configuration' in events
+    assert events.index('formats') < events.index('configuration')
+    assert json.loads(dict(emitted)['formats']) == format_catalog.CATALOG
+
+
+@pytest.mark.asyncio
+async def test_add_passes_an_ios_height_through(mock_dqueue):
+    resp = await main.add(_json_request(_valid_video_add_body(format="ios", quality="720")))
+    assert resp.status == 200
+    assert mock_dqueue.add.await_args.args[1:5] == ("video", "auto", "ios", "720")
+
+
+@pytest.mark.asyncio
+async def test_add_ignores_a_codec_on_a_type_that_has_none(mock_dqueue):
+    resp = await main.add(_json_request(
+        _valid_video_add_body(download_type="audio", codec="bogus", format="mp3", quality="320")
+    ))
+    assert resp.status == 200
+    assert mock_dqueue.add.await_args.args[1:5] == ("audio", "auto", "mp3", "320")
+
+
+@pytest.mark.asyncio
+async def test_add_rejects_a_value_the_catalog_does_not_offer(mock_dqueue):
+    with pytest.raises(web.HTTPBadRequest, match="quality must be one of"):
+        await main.add(_json_request(_valid_video_add_body(download_type="audio", format="flac", quality="320")))
+    mock_dqueue.add.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_with_only_a_url_downloads_the_best_video(mock_dqueue):
+    # Documented for integration authors on the wiki's "Sending links" page.
+    resp = await main.add(_json_request({"url": "https://example.com/v"}))
+    assert resp.status == 200
+    assert mock_dqueue.add.await_args.args[1:5] == ("video", "auto", "any", "best")

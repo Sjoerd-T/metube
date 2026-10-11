@@ -2,11 +2,71 @@ import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
 import { Subject, of } from 'rxjs';
 import { App } from './app';
-import { DownloadsService } from './services/downloads.service';
+import { NgbModal, NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
+import { AddDownloadPayload, DownloadsService } from './services/downloads.service';
 import { SubscriptionsService } from './services/subscriptions.service';
 import { ToastService } from './services/toast.service';
 import { CookieService } from 'ngx-cookie-service';
-import { Download } from './interfaces';
+import { Download, FormatCatalog } from './interfaces';
+
+const choice = (def: string, ...pairs: [string, string][]) => ({
+  default: def,
+  options: pairs.map(([id, text]) => ({ id, text })),
+});
+
+// Shaped like the catalog app/format_catalog.py sends; the tests rely on its
+// shape and a few of its entries, not on it matching the real one.
+function testCatalog(): FormatCatalog {
+  const videoQuality = choice('best', ['best', 'Best'], ['1080', '1080p'], ['720', '720p'], ['worst', 'Worst']);
+  const bestOnly = choice('best', ['best', 'Best']);
+  return {
+    download_type: {
+      default: 'video',
+      options: [
+        {
+          id: 'video',
+          text: 'Video',
+          codec: choice('auto', ['auto', 'Auto'], ['h264', 'H.264'], ['h265', 'H.265 (HEVC)']),
+          format: {
+            default: 'any',
+            options: [
+              { id: 'any', text: 'Auto', quality: videoQuality },
+              { id: 'mp4', text: 'MP4', quality: videoQuality },
+              { id: 'ios', text: 'iOS Compatible', quality: videoQuality },
+            ],
+          },
+        },
+        {
+          id: 'audio',
+          text: 'Audio',
+          format: {
+            default: 'm4a',
+            options: [
+              { id: 'auto', text: 'Auto', quality: bestOnly, tags: true },
+              { id: 'm4a', text: 'M4A', quality: choice('best', ['best', 'Best'], ['192', '192 kbps']), tags: true },
+              { id: 'mp3', text: 'MP3', quality: choice('best', ['best', 'Best'], ['320', '320 kbps']), tags: true },
+              { id: 'wav', text: 'WAV', quality: bestOnly, tags: false },
+              { id: 'flac', text: 'FLAC', quality: bestOnly, tags: true },
+            ],
+          },
+          audio_tags: choice('with_cover', ['with_cover', 'With cover'], ['no_cover', 'No cover'], ['none', 'None']),
+        },
+        {
+          id: 'captions',
+          text: 'Captions',
+          format: choice('srt', ['srt', 'SRT'], ['vtt', 'VTT'], ['dfxp', 'DFXP']),
+          subtitle_mode: choice('prefer_manual', ['prefer_manual', 'Prefer Manual'], ['auto_only', 'Auto Only']),
+          subtitle_language: choice('en', ['en', 'English'], ['de', 'German']),
+        },
+        {
+          id: 'thumbnail',
+          text: 'Thumbnail',
+          format: choice('jpg', ['jpg', 'JPG']),
+        },
+      ],
+    },
+  };
+}
 
 class DownloadsServiceStub {
   loading = false;
@@ -17,6 +77,8 @@ class DownloadsServiceStub {
   queueChanged = new Subject<void>();
   doneChanged = new Subject<void>();
   configurationChanged = new Subject<Record<string, unknown>>();
+  formats: FormatCatalog | null = testCatalog();
+  formatsChanged = new Subject<FormatCatalog>();
   customDirsChanged = new Subject<Record<string, string[]>>();
   ytdlOptionsChanged = new Subject<Record<string, unknown>>();
   updated = new Subject<void>();
@@ -30,8 +92,13 @@ class DownloadsServiceStub {
     return of({ presets: ['Preset A'] });
   }
 
-  add() {
+  add(payload?: unknown) {
+    void payload;
     return of({ status: 'ok' as const });
+  }
+
+  browse() {
+    return of({ status: 'ok' as const, title: '', entries: [] });
   }
 
   retry(id: string) {
@@ -249,6 +316,130 @@ describe('App', () => {
     expect(payload.ytdlOptionsOverrides).toBe('');
   });
 
+  describe('browse a playlist and queue picked entries (#1030)', () => {
+    const setup = (result: Promise<string[]>) => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      // App's imports bring their own NgbModal instance, so spy on the one it uses.
+      const modal = app['modal'] as NgbModal;
+      const componentInstance: { payload?: unknown } = {};
+      const openSpy = vi
+        .spyOn(modal, 'open')
+        .mockReturnValue({ componentInstance, result } as unknown as NgbModalRef);
+      const toasts = TestBed.inject(ToastService);
+      const infoSpy = vi.spyOn(toasts, 'info');
+      const errorSpy = vi.spyOn(toasts, 'error');
+      const addSpy = vi.spyOn(downloads, 'add');
+      app.addUrl = ' https://example.com/playlist ';
+      return { app, openSpy, componentInstance, infoSpy, errorSpy, addSpy };
+    };
+
+    it('does nothing when the URL box is empty', () => {
+      const { app, openSpy } = setup(Promise.resolve([]));
+      app.addUrl = '   ';
+      app.browsePlaylist();
+      expect(openSpy).not.toHaveBeenCalled();
+    });
+
+    it('opens the browser with the payload built from the form', () => {
+      downloads.configuration['ALLOW_YTDL_OPTIONS_OVERRIDES'] = true;
+      const { app, openSpy, componentInstance } = setup(new Promise(() => undefined));
+      app.playlistItemLimit = 7;
+      app.ytdlOptionsPresets = ['Preset A'];
+      app.ytdlOptionsOverrides = '{"a":1}';
+      app.browsePlaylist();
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      expect(componentInstance.payload).toEqual({
+        url: 'https://example.com/playlist',
+        playlistItemLimit: 7,
+        ytdlOptionsPresets: ['Preset A'],
+        ytdlOptionsOverrides: '{"a":1}',
+      });
+    });
+
+    it('does not send manual overrides when they are not allowed', () => {
+      const { app, componentInstance } = setup(new Promise(() => undefined));
+      app.ytdlOptionsOverrides = '{"exec":"echo hi"}';
+      app.browsePlaylist();
+      const sent = componentInstance.payload as { ytdlOptionsOverrides: string };
+      expect(sent.ytdlOptionsOverrides).toBe('');
+    });
+
+    it('refuses to open with invalid manual overrides', () => {
+      downloads.configuration['ALLOW_YTDL_OPTIONS_OVERRIDES'] = true;
+      const { app, openSpy, errorSpy } = setup(Promise.resolve([]));
+      app.ytdlOptionsOverrides = '{nope';
+      app.browsePlaylist();
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith('Custom yt-dlp options must be valid JSON');
+    });
+
+    it('refuses to open when chapter splitting lacks a section number', () => {
+      const { app, openSpy, errorSpy } = setup(Promise.resolve([]));
+      app.splitByChapters = true;
+      app.chapterTemplate = '%(title)s.%(ext)s';
+      app.browsePlaylist();
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith('Chapter template must include %(section_number)');
+    });
+
+    it('queues each picked url with the form settings and reports once', async () => {
+      const { app, addSpy, infoSpy, errorSpy } = setup(
+        Promise.resolve(['https://example.com/a', 'https://example.com/b']),
+      );
+      app.quality = '720';
+      app.browsePlaylist();
+      await vi.waitFor(() => expect(infoSpy).toHaveBeenCalled());
+      expect(addSpy).toHaveBeenCalledTimes(2);
+      expect(addSpy.mock.calls.map(([p]) => (p as AddDownloadPayload).url)).toEqual([
+        'https://example.com/a',
+        'https://example.com/b',
+      ]);
+      expect((addSpy.mock.calls[0][0] as AddDownloadPayload).quality).toBe('720');
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      expect(infoSpy).toHaveBeenCalledWith('Queued 2 items');
+      expect(errorSpy).not.toHaveBeenCalled();
+      // The URL box is left alone so the user can browse again.
+      expect(app.addUrl).toBe(' https://example.com/playlist ');
+    });
+
+    it('uses the singular for one item', async () => {
+      const { app, infoSpy } = setup(Promise.resolve(['https://example.com/a']));
+      app.browsePlaylist();
+      await vi.waitFor(() => expect(infoSpy).toHaveBeenCalledWith('Queued 1 item'));
+    });
+
+    it('reports partial failures with counts and the first error', async () => {
+      const { app, addSpy, infoSpy, errorSpy } = setup(
+        Promise.resolve([
+          'https://example.com/a',
+          'https://example.com/b',
+          'https://example.com/c',
+        ]),
+      );
+      addSpy.mockImplementation(((payload: AddDownloadPayload) =>
+        of(
+          payload.url.endsWith('/a')
+            ? { status: 'ok' }
+            : { status: 'error', msg: `bad ${payload.url.slice(-1)}` },
+        )) as unknown as typeof downloads.add);
+      app.browsePlaylist();
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalled());
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith('Queued 1 of 3; 2 failed: bad b');
+      expect(infoSpy).not.toHaveBeenCalled();
+    });
+
+    it('adds nothing when the modal is dismissed', async () => {
+      const { app, addSpy, infoSpy, errorSpy } = setup(Promise.reject('dismissed'));
+      app.browsePlaylist();
+      await new Promise((resolve) => setTimeout(resolve));
+      expect(addSpy).not.toHaveBeenCalled();
+      expect(infoSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+  });
+
   it('shows waiting badge for scheduled live stream', () => {
     downloads.queue.set('https://example.com/live', {
       id: 'live1',
@@ -320,14 +511,176 @@ describe('App', () => {
     expect(app.formatLabel(base)).toBe('-');
   });
 
+  describe('download options come from the server catalog', () => {
+    const fieldNames = (fixture: { nativeElement: HTMLElement }) =>
+      Array.from(
+        fixture.nativeElement.querySelectorAll<HTMLElement>(
+          '[name=downloadType],[name=codec],[name=format],[name=quality],[name=audioTags],[name=subtitleLanguage],[name=subtitleMode]',
+        ),
+      ).map(el => el.getAttribute('name'));
+
+    const select = (fixture: { nativeElement: HTMLElement }, name: string) =>
+      fixture.nativeElement.querySelector<HTMLSelectElement>(`select[name=${name}]`);
+
+    // ngModel writes values and disabled state in a microtask.
+    const render = async (fixture: { detectChanges: () => void }) => {
+      fixture.detectChanges();
+      await Promise.resolve();
+      fixture.detectChanges();
+    };
+
+    it('shows no options until the catalog arrives, then restores the remembered choices', async () => {
+      downloads.formats = null;
+      const cookies = TestBed.inject(CookieService);
+      cookies.set('metube_download_type', 'audio');
+      cookies.set('metube_format', 'mp3');
+      cookies.set('metube_quality', '320');
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      await render(fixture);
+      expect(fieldNames(fixture)).toEqual([]);
+
+      downloads.formatsChanged.next(testCatalog());
+      await render(fixture);
+
+      expect(fieldNames(fixture)).toEqual(['downloadType', 'format', 'quality', 'audioTags']);
+      expect([app.downloadType, app.format, app.quality]).toEqual(['audio', 'mp3', '320']);
+      expect(select(fixture, 'format')?.selectedOptions[0]?.textContent?.trim()).toBe('MP3');
+    });
+
+    it('replaces remembered choices the catalog does not offer with its defaults', () => {
+      const cookies = TestBed.inject(CookieService);
+      cookies.set('metube_download_type', 'audio');
+      cookies.set('metube_format', 'ogg');
+      cookies.set('metube_quality', '999');
+      cookies.set('metube_audio_tags', 'everything');
+      cookies.set('metube_subtitle_mode', 'bogus');
+      const app = TestBed.createComponent(App).componentInstance;
+
+      expect([app.format, app.quality, app.audioTags, app.subtitleMode])
+        .toEqual(['m4a', 'best', 'with_cover', 'prefer_manual']);
+      expect(app.subtitleLanguage).toBe('en');
+
+      TestBed.inject(CookieService).set('metube_download_type', 'gif');
+      expect(TestBed.createComponent(App).componentInstance.downloadType).toBe('video');
+    });
+
+    it('keeps a free-form subtitle language the suggestions do not list', () => {
+      TestBed.inject(CookieService).set('metube_subtitle_language', 'fil');
+      const app = TestBed.createComponent(App).componentInstance;
+      expect(app.subtitleLanguage).toBe('fil');
+    });
+
+    it('leaves the form alone when the same catalog is resent, and re-checks it when the catalog changes', () => {
+      const app = TestBed.createComponent(App).componentInstance;
+      // Mid-edit, not yet saved: a reconnect resending the same catalog must
+      // not re-apply the remembered choices over it.
+      app.quality = '720';
+
+      downloads.formatsChanged.next(testCatalog());
+      expect(app.quality).toBe('720');
+
+      const changed = testCatalog();
+      const video = changed.download_type.options[0];
+      video.format.options = video.format.options.map(f => ({
+        ...f,
+        quality: { default: 'best', options: [{ id: 'best', text: 'Best' }, { id: '1080', text: '1080p' }] },
+      }));
+      downloads.formatsChanged.next(changed);
+      expect(app.quality).toBe('best');
+      expect(app.qualities.map(q => q.id)).toEqual(['best', '1080']);
+    });
+
+    it('shows the fields each type carries, in a fixed order', async () => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      const expected: Record<string, string[]> = {
+        video: ['downloadType', 'codec', 'format', 'quality'],
+        audio: ['downloadType', 'format', 'quality', 'audioTags'],
+        captions: ['downloadType', 'format', 'subtitleLanguage', 'subtitleMode'],
+        thumbnail: ['downloadType', 'format'],
+      };
+      await render(fixture);
+      for (const [type, names] of Object.entries(expected)) {
+        // Picked in the Type dropdown, as a user would.
+        const typeSelect = select(fixture, 'downloadType')!;
+        typeSelect.selectedIndex = Array.from(typeSelect.options).findIndex(o => o.textContent?.trim().toLowerCase() === type);
+        typeSelect.dispatchEvent(new Event('change'));
+        await render(fixture);
+        expect(app.downloadType).toBe(type);
+        expect(fieldNames(fixture), type).toEqual(names);
+      }
+      expect(app.optionColumnClass()).toBe('col-md-6');
+    });
+
+    it('disables a list that has nothing to pick', async () => {
+      const fixture = TestBed.createComponent(App);
+      const app = fixture.componentInstance;
+      app.downloadType = 'audio';
+      app.downloadTypeChanged();
+      app.format = 'flac';
+      app.formatChanged();
+      await render(fixture);
+      expect(select(fixture, 'quality')?.disabled).toBe(true);
+
+      app.format = 'mp3';
+      app.formatChanged();
+      await render(fixture);
+      expect(select(fixture, 'quality')?.disabled).toBe(false);
+
+      app.downloadType = 'thumbnail';
+      app.downloadTypeChanged();
+      await render(fixture);
+      expect(select(fixture, 'format')?.disabled).toBe(true);
+      expect(select(fixture, 'format')?.selectedOptions[0]?.textContent?.trim()).toBe('JPG');
+    });
+
+    it('offers an option added to the catalog without any other change', () => {
+      const catalog = testCatalog();
+      catalog.download_type.options[1].format.options.push({
+        id: 'aac',
+        text: 'AAC',
+        quality: { default: 'best', options: [{ id: 'best', text: 'Best' }, { id: '256', text: '256 kbps' }] },
+        tags: true,
+      });
+      downloads.formats = catalog;
+      const app = TestBed.createComponent(App).componentInstance;
+      app.downloadType = 'audio';
+      app.downloadTypeChanged();
+      app.format = 'aac';
+      app.formatChanged();
+      app.quality = '256';
+      app.qualityChanged();
+
+      expect(app.formatOptions.map(f => f.text)).toContain('AAC');
+      expect(app.qualities.map(q => q.text)).toEqual(['Best', '256 kbps']);
+      const payload = app['buildAddPayload']();
+      expect([payload.downloadType, payload.format, payload.quality]).toEqual(['audio', 'aac', '256']);
+    });
+
+    it('labels queued downloads from the catalog, under their own type', () => {
+      const app = TestBed.createComponent(App).componentInstance;
+      const dl = (fields: Partial<Download>) => ({ format: '', quality: '', ...fields }) as Download;
+
+      expect(app.formatQualityLabel(dl({ download_type: 'video', format: 'any', quality: '1080' }))).toBe('1080p');
+      expect(app.formatQualityLabel(dl({ download_type: 'audio', format: 'mp3', quality: '320' }))).toBe('320 kbps');
+      expect(app.formatQualityLabel(dl({ download_type: 'captions', format: 'srt', quality: 'best' }))).toBe('-');
+      expect(app.formatCodecLabel(dl({ download_type: 'video', codec: 'h265' }))).toBe('H.265 (HEVC)');
+      expect(app.formatCodecLabel(dl({ download_type: 'audio', format: 'flac' }))).toBe('FLAC');
+      expect(app.downloadTypeLabel(dl({ download_type: 'captions' }))).toBe('Captions');
+      expect(app.formatLabel(dl({ download_type: 'audio', format: 'auto' }))).toBe('Auto');
+      expect(app.formatLabel(dl({ download_type: 'captions', format: 'dfxp' }))).toBe('DFXP');
+    });
+  });
+
   describe('audio Auto format and Tags dropdown', () => {
     it('lists Auto first but still defaults a switch to Audio to M4A', () => {
       const app = TestBed.createComponent(App).componentInstance;
-      expect(app.audioFormats[0].id).toBe('auto');
 
       app.downloadType = 'audio';
       app.downloadTypeChanged();
 
+      expect(app.formatOptions[0].id).toBe('auto');
       expect(app.format).toBe('m4a');
     });
 
@@ -657,6 +1010,74 @@ describe('App', () => {
   // Issue #1012: in ask mode (DELETE_FILE_ON_TRASHCAN='ask') the server only
   // deletes a completed download's file when told to, so the UI must ask the
   // user whether to keep or delete it before removing the list entry.
+  describe('Clear failed asks first (#1094)', () => {
+    const failed = (url: string) => ({
+      id: url, title: url, url, quality: 'best', format: 'any', folder: '', custom_name_prefix: '',
+      playlist_item_limit: 0, status: 'error', msg: 'boom', percent: 0, speed: 0, eta: 0,
+      filename: '', checked: false,
+    }) as Download;
+
+    it('clears nothing when cancelled', async () => {
+      downloads.done.set('u1', failed('u1'));
+      const app = TestBed.createComponent(App).componentInstance;
+      vi.spyOn(TestBed.inject(ToastService), 'confirm').mockResolvedValue(false);
+      const delSpy = vi.spyOn(downloads, 'delById');
+
+      await app.clearFailedDownloads();
+
+      expect(delSpy).not.toHaveBeenCalled();
+    });
+
+    it('clears every failed row, and only those, when confirmed', async () => {
+      downloads.done.set('u1', failed('u1'));
+      downloads.done.set('u2', failed('u2'));
+      downloads.done.set('ok', { ...failed('ok'), status: 'finished' });
+      const app = TestBed.createComponent(App).componentInstance;
+      const confirmSpy = vi.spyOn(TestBed.inject(ToastService), 'confirm').mockResolvedValue(true);
+      const delSpy = vi.spyOn(downloads, 'delById');
+
+      await app.clearFailedDownloads();
+
+      expect(confirmSpy).toHaveBeenCalledWith(
+        'Clear 2 failed downloads? Their URLs are not kept anywhere else, so retrying later means finding them again.',
+        'Clear',
+        'Cancel',
+      );
+      expect(delSpy).toHaveBeenCalledWith('done', ['u1', 'u2'], undefined);
+    });
+
+    it('words the question for a single row', async () => {
+      downloads.done.set('u1', failed('u1'));
+      const app = TestBed.createComponent(App).componentInstance;
+      const confirmSpy = vi.spyOn(TestBed.inject(ToastService), 'confirm').mockResolvedValue(false);
+
+      await app.clearFailedDownloads();
+
+      expect(confirmSpy.mock.calls[0][0]).toMatch(/^Clear the failed download\? Its URL is not kept/);
+    });
+
+    it('asks nothing when there is nothing to clear', async () => {
+      const app = TestBed.createComponent(App).componentInstance;
+      const confirmSpy = vi.spyOn(TestBed.inject(ToastService), 'confirm');
+
+      await app.clearFailedDownloads();
+
+      expect(confirmSpy).not.toHaveBeenCalled();
+    });
+
+    it('leaves Clear completed unprompted', async () => {
+      downloads.done.set('ok', { ...failed('ok'), status: 'finished' });
+      const app = TestBed.createComponent(App).componentInstance;
+      const confirmSpy = vi.spyOn(TestBed.inject(ToastService), 'confirm');
+      const delSpy = vi.spyOn(downloads, 'delById');
+
+      await app.clearCompletedDownloads();
+
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(delSpy).toHaveBeenCalledWith('done', ['ok'], undefined);
+    });
+  });
+
   describe('delete confirmation in ask mode (#1012)', () => {
     const doneEntry = (over: Partial<Download>): Download => ({
       id: 'vid1',
@@ -757,11 +1178,14 @@ describe('App', () => {
       const fixture = TestBed.createComponent(App);
       const app = fixture.componentInstance;
       const toasts = TestBed.inject(ToastService);
+      // Clear failed's own confirmation (#1094), answered yes.
+      const confirmSpy = vi.spyOn(toasts, 'confirm').mockResolvedValue(true);
       const chooseSpy = vi.spyOn(toasts, 'choose');
       const delSpy = vi.spyOn(downloads, 'delById');
 
       await app.clearFailedDownloads();
 
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
       expect(chooseSpy).not.toHaveBeenCalled();
       expect(delSpy).toHaveBeenCalledWith('done', ['u1'], false);
     });
@@ -777,11 +1201,14 @@ describe('App', () => {
       const fixture = TestBed.createComponent(App);
       const app = fixture.componentInstance;
       const toasts = TestBed.inject(ToastService);
+      const confirmSpy = vi.spyOn(toasts, 'confirm');
       const chooseSpy = vi.spyOn(toasts, 'choose').mockResolvedValue(true);
       const delSpy = vi.spyOn(downloads, 'delById');
 
       await app.clearFailedDownloads();
 
+      // The file prompt has Cancel, so it is the only question asked.
+      expect(confirmSpy).not.toHaveBeenCalled();
       expect(chooseSpy).toHaveBeenCalledTimes(1);
       expect(delSpy).toHaveBeenCalledWith('done', ['u1'], true);
     });
