@@ -7,12 +7,14 @@ on:
 jobs:
   update-yt-dlp :
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       -
         name: Checkout
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.AUTOUPDATE_PAT }}
+          token: ${{ secrets.AUTOUPDATE_PAT || github.token }}
       -
         name: Set up Python
         uses: actions/setup-python@v7
